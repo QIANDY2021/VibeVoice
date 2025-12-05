@@ -369,6 +369,16 @@
     </section>
 
     <section class="panel">
+      <span class="field-label">Clone Voice</span>
+      <div class="control-row">
+        <input id="cloneName" class="select-control" placeholder="New voice key (e.g., MyClone)" />
+        <input id="cloneFile" type="file" accept="audio/*" class="select-control" />
+        <button id="cloneBtn" type="button" class="secondary-btn">Upload & Create</button>
+      </div>
+      <span class="helper-text">Upload a reference audio and create a new voice preset. The new voice will appear in the list above.</span>
+    </section>
+
+    <section class="panel">
       <div class="metrics">
         <span>Model Generated Audio<strong id="modelGenerated">0.00</strong><span class="metric-unit">s</span></span>
         <span>Audio Played<strong id="playbackElapsed">0.00</strong><span class="metric-unit">s</span></span>
@@ -409,6 +419,9 @@
   const logOutput = document.getElementById('logOutput');
   const resetBtn = document.getElementById('resetControls');
   const saveBtn = document.getElementById('saveAudio');
+  const cloneBtn = document.getElementById('cloneBtn');
+  const cloneFile = document.getElementById('cloneFile');
+  const cloneName = document.getElementById('cloneName');
 
   let playbackTimer = null;
   let lastPlaybackElapsed = 0;
@@ -704,6 +717,37 @@
   };
 
   loadVoices();
+
+  const cloneVoice = async () => {
+    try {
+      const name = (cloneName?.value || '').trim();
+      const file = cloneFile?.files?.[0] || null;
+      if (!name || !file) {
+        appendLog('[Frontend] Please provide voice key and audio file');
+        return;
+      }
+      const fd = new FormData();
+      fd.set('speaker_key', name);
+      fd.set('file', file, file.name);
+      const resp = await fetch('/clone', { method: 'POST', body: fd });
+      if (!resp.ok) {
+        appendLog(`[Error] Clone request failed: ${resp.status}`);
+        return;
+      }
+      const data = await resp.json();
+      appendLog(`[Frontend] Clone success: ${data.speaker_key}`);
+      await loadVoices();
+      if (voiceSelect) {
+        voiceSelect.value = data.speaker_key;
+      }
+    } catch (err) {
+      appendLog(`[Error] Clone failed: ${err?.message || err}`);
+    }
+  };
+
+  if (cloneBtn) {
+    cloneBtn.addEventListener('click', cloneVoice);
+  }
 
   resetBtn.addEventListener('click', () => {
     cfgSelect.value = '1.5';

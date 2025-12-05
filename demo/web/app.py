@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, Iterator, Optional, Tuple, cast
 
 import numpy as np
 import torch
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketDisconnect, WebSocketState
@@ -46,6 +46,7 @@ class StreamingTTSService:
         inference_steps: int = 5,
     ) -> None:
         self.model_path = Path(model_path)
+        self.model_path_str = model_path
         self.inference_steps = inference_steps
         self.sample_rate = SAMPLE_RATE
 
@@ -65,8 +66,9 @@ class StreamingTTSService:
         self._torch_device = torch.device(device)
 
     def load(self) -> None:
-        print(f"[startup] Loading processor from {self.model_path}")
-        self.processor = VibeVoiceStreamingProcessor.from_pretrained(str(self.model_path))
+        print(f"[startup] Loading processor from {self.model_path_str}")
+        hub_id = self.model_path_str.replace("\\", "/")
+        self.processor = VibeVoiceStreamingProcessor.from_pretrained(hub_id)
 
         
         # Decide dtype & attention
@@ -86,7 +88,7 @@ class StreamingTTSService:
         # Load model
         try:
             self.model = VibeVoiceStreamingForConditionalGenerationInference.from_pretrained(
-                str(self.model_path),
+                hub_id,
                 torch_dtype=load_dtype,
                 device_map=device_map,
                 attn_implementation=attn_impl_primary,
@@ -99,7 +101,7 @@ class StreamingTTSService:
                 print("Error loading the model. Trying to use SDPA. However, note that only flash_attention_2 has been fully tested, and using SDPA may result in lower audio quality.")
                 
                 self.model = VibeVoiceStreamingForConditionalGenerationInference.from_pretrained(
-                    str(self.model_path),
+                    hub_id,
                     torch_dtype=load_dtype,
                     device_map=self.device,
                     attn_implementation='sdpa',
@@ -174,6 +176,55 @@ class StreamingTTSService:
 
         prefilled_outputs = self._ensure_voice_cached(key)
         return key, prefilled_outputs
+
+    def generate_voice_preset_from_audio(self, audio_path: str, speaker_key: str) -> Path:
+        if not self.processor or not self.model:
+            raise RuntimeError("StreamingTTSService not initialized")
+
+        wav = self.processor.audio_processor._load_audio_from_path(audio_path)
+        if self.processor.db_normalize and self.processor.audio_normalizer:
+            wav = self.processor.audio_normalizer(wav)
+
+        vae_tok_len = int(np.ceil(wav.shape[0] / self.processor.speech_tok_compress_ratio))
+        tokens = []
+        tokens += self.processor.tokenizer.encode(' Voice input:\n', add_special_tokens=False)
+        tokens += self.processor.tokenizer.encode(' Speaker 0:', add_special_tokens=False)
+        tokens += [self.processor.tokenizer.speech_start_id]
+        tokens += [self.processor.tokenizer.speech_diffusion_id] * vae_tok_len
+        tokens += [self.processor.tokenizer.speech_end_id]
+        tokens += self.processor.tokenizer.encode('\n', add_special_tokens=False)
+        tokens += self.processor.tokenizer.encode(' Speech output:\n', add_special_tokens=False)
+        tokens += [self.processor.tokenizer.speech_start_id]
+
+        device = self._torch_device
+        ids = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
+        mask = torch.ones_like(ids, device=device)
+
+        lm_out = self.model.forward_lm(input_ids=ids, attention_mask=mask, use_cache=True, return_dict=True)
+        tts_mask = torch.ones_like(ids[:, -1:], device=device)
+        tts_out = self.model.forward_tts_lm(input_ids=ids, attention_mask=mask, use_cache=True, return_dict=True, tts_text_masks=tts_mask, lm_last_hidden_state=lm_out.last_hidden_state)
+
+        neg_id = self.processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        neg_ids = torch.tensor([[neg_id]], dtype=torch.long, device=device)
+        neg_mask = torch.ones_like(neg_ids, device=device)
+        neg_lm_out = self.model.forward_lm(input_ids=neg_ids, attention_mask=neg_mask, use_cache=True, return_dict=True)
+        neg_tts_mask = torch.ones_like(neg_ids[:, -1:], device=device)
+        neg_tts_out = self.model.forward_tts_lm(input_ids=neg_ids, attention_mask=neg_mask, use_cache=True, return_dict=True, tts_text_masks=neg_tts_mask, lm_last_hidden_state=neg_lm_out.last_hidden_state)
+
+        save_dir = BASE.parent / "voices" / "streaming_model"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        save_path = save_dir / f"{speaker_key}.pt"
+        torch.save({
+            'lm': lm_out,
+            'tts_lm': tts_out,
+            'neg_lm': neg_lm_out,
+            'neg_tts_lm': neg_tts_out,
+        }, save_path)
+
+        self.voice_presets[speaker_key] = save_path
+        self._voice_cache.pop(speaker_key, None)
+        self._ensure_voice_cached(speaker_key)
+        return save_path
 
     def _prepare_inputs(self, text: str, prefilled_outputs: object):
         if not self.processor or not self.model:
@@ -503,4 +554,17 @@ def get_config():
         "voices": voices,
         "default_voice": service.default_voice_key,
     }
+
+
+@app.post("/clone")
+async def clone_voice(speaker_key: str = Form(...), file: UploadFile = File(...)):
+    service: StreamingTTSService = app.state.tts_service
+    tmp_dir = BASE / "tmp"
+    tmp_dir.mkdir(exist_ok=True)
+    tmp_path = tmp_dir / f"upload_{speaker_key}_{get_timestamp().replace(':','-').replace(' ','_')}.wav"
+    content = await file.read()
+    with open(tmp_path, "wb") as f:
+        f.write(content)
+    preset_path = service.generate_voice_preset_from_audio(str(tmp_path), speaker_key)
+    return {"preset_path": str(preset_path), "speaker_key": speaker_key}
 
